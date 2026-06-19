@@ -2,7 +2,11 @@
 #include <stdarg.h>
 #include <pico/stdlib.h>
 #include <pico/cyw43_arch.h>
+
+// STRICT ISOLATION: We only include the run loop here to attach TinyUSB.
+// Including <btstack.h> causes HID struct collisions with <tusb.h>.
 #include <btstack_run_loop.h>
+
 #include "tusb.h"
 #include "bt_bridge.h"
 #include "joycon_translator.h"
@@ -15,12 +19,12 @@ void cdc_printf(const char *format, ...) {
     int len = vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
     
-    // Print to hardware UART
-    printf("%s", buffer); 
+    printf("%s", buffer); // Hardware UART
     
-    // Print to USB Serial if a host terminal is connected
-    if (tud_cdc_connected()) {
-        tud_cdc_write(buffer, len);
+    // Verify there is space in the buffer and write it
+    uint32_t avail = tud_cdc_write_available();
+    if (avail > 0) {
+        tud_cdc_write(buffer, len > avail ? avail : len);
         tud_cdc_write_flush();
     }
 }
@@ -30,28 +34,54 @@ static void usb_poll_process(btstack_data_source_t *ds, btstack_data_source_call
     tud_task();
 }
 
-int main() {
-    // Initialize CYW43 BEFORE TinyUSB/stdio to prevent boot timeouts on the USB host.
-    // NOTE: cyw43_arch_init() internally handles btstack_memory_init() and 
-    // btstack_run_loop_init() within the Pico SDK.
-    if (cyw43_arch_init()) return -1;
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+static btstack_timer_source_t heartbeat_timer;
+static void heartbeat_handler(btstack_timer_source_t *ts) {
+    static bool led_state = true;
+    led_state = !led_state;
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_state);
+    
+    btstack_run_loop_set_timer(ts, 500); 
+    btstack_run_loop_add_timer(ts);
+}
 
-    // Initialize TinyUSB manually because we disabled stdio_usb
-    tusb_init();
+int main() {
+    // 1. Initialize core system IO first
     stdio_init_all();
+    tusb_init();
     joycon_init();
+
+    // 2. Blind 3-second boot delay polling the USB task.
+    // This gives the host PC time to enumerate the CDC interface, and gives 
+    // the user a window to execute `cat /dev/ttyACM0` before logs are fired.
+    uint32_t t = time_us_32();
+    while (time_us_32() - t < 3000000) {
+        tud_task();
+    }
 
     cdc_printf("\n\n--- Pico 2W Joy-Con Bridge Booted ---\n");
 
-    // Initialize Bluetooth profiles and Power-On HCI
+    // 3. Initialize Wi-Fi / CYW43 architecture AFTER standard IO.
+    // In the Pico SDK, this implicitly initializes BTstack memory, run loop, 
+    // and the CYW43 HCI transport securely behind the scenes.
+    if (cyw43_arch_init()) {
+        cdc_printf("CRITICAL ERROR: Failed to initialize CYW43 architecture!\n");
+        return -1;
+    }
+
+    // 4. Initialize our custom Bluetooth logic
     bt_bridge_init();
 
-    // Attach USB to the run loop and execute
+    // Attach TinyUSB to the BTstack run loop
     btstack_run_loop_set_data_source_handler(&usb_ds, &usb_poll_process);
     btstack_run_loop_enable_data_source_callbacks(&usb_ds, DATA_SOURCE_CALLBACK_POLL);
     btstack_run_loop_add_data_source(&usb_ds);
 
+    // Attach heartbeat timer to the BTstack run loop
+    btstack_run_loop_set_timer_handler(&heartbeat_timer, heartbeat_handler);
+    btstack_run_loop_set_timer(&heartbeat_timer, 500);
+    btstack_run_loop_add_timer(&heartbeat_timer);
+
+    // Start the shared event loop (Never returns)
     btstack_run_loop_execute();
     return 0;
 }
