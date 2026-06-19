@@ -3,33 +3,64 @@
 #include <string.h>
 #include "joycon_translator.h"
 
-// Expose our custom USB Serial logger from main.c
 extern void cdc_printf(const char *format, ...);
+
+// Joy-Con Initialization State Machine
+typedef enum {
+    JC_STATE_NONE = 0,
+    JC_STATE_REQ_INFO,
+    JC_STATE_SET_MODE,
+    JC_STATE_SET_LED,
+    JC_STATE_RUNNING
+} jc_state_t;
 
 static uint16_t jc_left_ctrl_cid = 0, jc_left_intr_cid = 0;
 static uint16_t jc_right_ctrl_cid = 0, jc_right_intr_cid = 0;
 static bd_addr_t jc_left_addr, jc_right_addr;
 static bool found_left = false, found_right = false;
 
-static bool jc_left_handshake_pending = false;
-static bool jc_right_handshake_pending = false;
+static jc_state_t jc_left_state = JC_STATE_NONE;
+static jc_state_t jc_right_state = JC_STATE_NONE;
+static bool jc_left_pending = false;
+static bool jc_right_pending = false;
+
+static uint8_t packet_counter = 0;
 
 static btstack_packet_callback_registration_t hci_event_callback_registration;
-
-// Forward declare the handler so check_device_name can use it
 static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 
-// Joy-Con handshake command to enable Standard Full Mode (0x30)
-static const uint8_t JC_ENABLE_FULL_MODE[] = {
-    0xA2, 0x01, 0x00, // HID DATA OUTPUT + Report 0x01 + Packet Counter
-    0x00, 0x01, 0x40, 0x40, // Left Rumble Base
-    0x00, 0x01, 0x40, 0x40, // Right Rumble Base
-    0x03, 0x30 // Subcommand 0x03 (Set Input Mode), Arg 0x30 (Standard Full)
-};
+// --- State Machine Helpers ---
 
-static void send_handshake(uint16_t cid) {
-    l2cap_send(cid, (uint8_t*)JC_ENABLE_FULL_MODE, sizeof(JC_ENABLE_FULL_MODE));
-    cdc_printf("-> Sent Standard Full Mode command to CID 0x%04x\n", cid);
+static void jc_advance_state(bool is_left, jc_state_t next_state) {
+    if (is_left) {
+        jc_left_state = next_state;
+        jc_left_pending = true;
+        if (jc_left_intr_cid) l2cap_request_can_send_now_event(jc_left_intr_cid);
+    } else {
+        jc_right_state = next_state;
+        jc_right_pending = true;
+        if (jc_right_intr_cid) l2cap_request_can_send_now_event(jc_right_intr_cid);
+    }
+}
+
+static void send_subcmd(uint16_t cid, uint8_t subcmd, const uint8_t *args, uint8_t arg_len) {
+    uint8_t buf[64];
+    buf[0] = 0xA2; // HID DATA OUTPUT
+    buf[1] = 0x01; // Report ID
+    buf[2] = packet_counter++;
+    if (packet_counter > 0x0F) packet_counter = 0;
+    
+    // 8 bytes rumble data (neutral)
+    uint8_t rumble[8] = {0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40};
+    memcpy(&buf[3], rumble, 8);
+    
+    buf[11] = subcmd;
+    if (arg_len > 0 && args != NULL) {
+        memcpy(&buf[12], args, arg_len);
+    }
+    
+    l2cap_send(cid, buf, 12 + arg_len);
+    cdc_printf("-> Sent Subcmd 0x%02x to CID 0x%04x\n", subcmd, cid);
 }
 
 static void check_device_name(bd_addr_t addr, const char* name) {
@@ -54,7 +85,6 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
             case BTSTACK_EVENT_STATE:
                 if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
                     cdc_printf("Bluetooth Baseband Working. Scanning for Joy-Cons...\n");
-                    // Start periodic scanning
                     gap_inquiry_periodic_start(0x03, 0x05, 0x04); 
                 }
                 break;
@@ -70,8 +100,6 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                     name[len] = 0;
                     check_device_name(addr, name);
                 } else {
-                    // Joy-Cons do NOT broadcast their name in the EIR packet during pairing mode.
-                    // We must filter by Peripheral Class of Device (0x0500) and manually request the name.
                     uint32_t cod = gap_event_inquiry_result_get_class_of_device(packet);
                     if ((cod & 0x1F00) == 0x0500) {
                         uint8_t page_scan_rep_mode = gap_event_inquiry_result_get_page_scan_repetition_mode(packet);
@@ -86,14 +114,12 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                 bd_addr_t addr;
                 hci_event_remote_name_request_complete_get_bd_addr(packet, addr);
                 if (hci_event_remote_name_request_complete_get_status(packet) == 0) {
-                    // BTstack guarantees this string is safely null-terminated
                     const char* name = (const char*)hci_event_remote_name_request_complete_get_remote_name(packet);
                     check_device_name(addr, name);
                 }
                 break;
             }
 
-            // --- SECURITY AND PAIRING EVENTS ---
             case HCI_EVENT_PIN_CODE_REQUEST: {
                 bd_addr_t event_addr;
                 hci_event_pin_code_request_get_bd_addr(packet, event_addr);
@@ -101,6 +127,7 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                 gap_pin_code_response_binary(event_addr, (uint8_t*)"0000", 4);
                 break;
             }
+
             case HCI_EVENT_USER_CONFIRMATION_REQUEST: {
                 bd_addr_t event_addr;
                 hci_event_user_confirmation_request_get_bd_addr(packet, event_addr);
@@ -109,7 +136,6 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                 break;
             }
 
-            // --- CONNECTION EVENTS ---
             case L2CAP_EVENT_INCOMING_CONNECTION: {
                 bd_addr_t addr;
                 l2cap_event_incoming_connection_get_address(packet, addr);
@@ -118,7 +144,6 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                 bool is_left = (bd_addr_cmp(addr, jc_left_addr) == 0);
                 bool is_right = (bd_addr_cmp(addr, jc_right_addr) == 0);
 
-                // If a sleeping Joy-Con wakes up and connects to us, assign it!
                 if (!is_left && !is_right) {
                     if (!found_left) {
                         found_left = true;
@@ -129,7 +154,6 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                         bd_addr_copy(jc_right_addr, addr);
                         cdc_printf("Incoming HID connection assigned to Right Joy-Con: %s\n", bd_addr_to_str(addr));
                     } else {
-                        cdc_printf("Unknown device %s tried to connect. Declining.\n", bd_addr_to_str(addr));
                         l2cap_decline_connection(local_cid);
                         break;
                     }
@@ -159,8 +183,6 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                     if (is_left) jc_left_ctrl_cid = local_cid;
                     else jc_right_ctrl_cid = local_cid;
                     
-                    // If we initiated the connection, we must also open the interrupt channel.
-                    // If THEY initiated, we wait for them to open the interrupt channel.
                     if (!incoming) {
                         cdc_printf("Initiating HID Interrupt channel...\n");
                         l2cap_create_channel(bt_packet_handler, addr, PSM_HID_INTERRUPT, 0xffff, 
@@ -168,65 +190,104 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                     }
                 } 
                 else if (psm == PSM_HID_INTERRUPT) {
-                    cdc_printf("HID Interrupt Opened for %s. Requesting handshake transmit.\n", is_left ? "Left" : "Right");
-                    if (is_left) {
-                        jc_left_intr_cid = local_cid;
-                        jc_left_handshake_pending = true;
-                    } else {
-                        jc_right_intr_cid = local_cid;
-                        jc_right_handshake_pending = true;
-                    }
-                    l2cap_request_can_send_now_event(local_cid);
+                    cdc_printf("HID Interrupt Opened for %s. Starting init sequence...\n", is_left ? "Left" : "Right");
+                    if (is_left) jc_left_intr_cid = local_cid;
+                    else jc_right_intr_cid = local_cid;
+                    
+                    // Kick off the Nintendo 3-Step Handshake
+                    jc_advance_state(is_left, JC_STATE_REQ_INFO);
                 }
                 break;
             }
 
             case L2CAP_EVENT_CAN_SEND_NOW: {
                 uint16_t local_cid = l2cap_event_can_send_now_get_local_cid(packet);
-                if (local_cid == jc_left_intr_cid && jc_left_handshake_pending) {
-                    send_handshake(local_cid);
-                    jc_left_handshake_pending = false;
-                } else if (local_cid == jc_right_intr_cid && jc_right_handshake_pending) {
-                    send_handshake(local_cid);
-                    jc_right_handshake_pending = false;
+                
+                if (local_cid == jc_left_intr_cid && jc_left_pending) {
+                    jc_left_pending = false;
+                    if (jc_left_state == JC_STATE_REQ_INFO) {
+                        send_subcmd(local_cid, 0x02, NULL, 0);
+                    } else if (jc_left_state == JC_STATE_SET_MODE) {
+                        uint8_t arg = 0x30; // Standard Full Mode
+                        send_subcmd(local_cid, 0x03, &arg, 1);
+                    } else if (jc_left_state == JC_STATE_SET_LED) {
+                        uint8_t arg = 0x01; // P1 LED
+                        send_subcmd(local_cid, 0x30, &arg, 1);
+                    }
+                } 
+                else if (local_cid == jc_right_intr_cid && jc_right_pending) {
+                    jc_right_pending = false;
+                    if (jc_right_state == JC_STATE_REQ_INFO) {
+                        send_subcmd(local_cid, 0x02, NULL, 0);
+                    } else if (jc_right_state == JC_STATE_SET_MODE) {
+                        uint8_t arg = 0x30;
+                        send_subcmd(local_cid, 0x03, &arg, 1);
+                    } else if (jc_right_state == JC_STATE_SET_LED) {
+                        uint8_t arg = 0x02; // P2 LED
+                        send_subcmd(local_cid, 0x30, &arg, 1);
+                    }
                 }
                 break;
             }
         }
     } 
     else if (packet_type == L2CAP_DATA_PACKET) {
-        if (channel == jc_left_intr_cid) joycon_parse_l2cap_report(packet, true);
-        else if (channel == jc_right_intr_cid) joycon_parse_l2cap_report(packet, false);
+        bool is_left = (channel == jc_left_intr_cid);
+        bool is_right = (channel == jc_right_intr_cid);
+
+        if (is_left || is_right) {
+            uint8_t report_id = packet[1]; // packet[0] is 0xA1 (HID DATA)
+            
+            // Subcommand ACK
+            if (report_id == 0x21 && size >= 16) {
+                uint8_t subcmd_replied = packet[15];
+                cdc_printf("<- Received ACK for subcmd 0x%02x from %s\n", subcmd_replied, is_left ? "Left" : "Right");
+                
+                jc_state_t current_state = is_left ? jc_left_state : jc_right_state;
+                
+                if (current_state == JC_STATE_REQ_INFO && subcmd_replied == 0x02) {
+                    jc_advance_state(is_left, JC_STATE_SET_MODE);
+                } else if (current_state == JC_STATE_SET_MODE && subcmd_replied == 0x03) {
+                    jc_advance_state(is_left, JC_STATE_SET_LED);
+                } else if (current_state == JC_STATE_SET_LED && subcmd_replied == 0x30) {
+                    if (is_left) jc_left_state = JC_STATE_RUNNING;
+                    else jc_right_state = JC_STATE_RUNNING;
+                    cdc_printf("*** %s Joy-Con Fully Initialized and Running! ***\n", is_left ? "Left" : "Right");
+                }
+            } 
+            else {
+                // Pass standard controller reports to the translator
+                joycon_parse_l2cap_report(packet, is_left);
+            }
+        }
     }
 }
 
 void bt_bridge_init(void) {
-    // 1. Setup GAP Policies (Classic Bluetooth)
     gap_set_security_level(LEVEL_1); 
-    gap_connectable_control(1);      // Accept incoming connections from sleeping Joy-Cons
+    gap_connectable_control(1);
     gap_discoverable_control(0);
     
-    // 2. Setup Secure Simple Pairing (SSP)
     gap_ssp_set_enable(1);
     gap_ssp_set_io_capability(SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
     gap_ssp_set_authentication_requirement(SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING);
     
-    gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH | LM_LINK_POLICY_ENABLE_SNIFF_MODE);
+    // CRITICAL FIX: Removed LM_LINK_POLICY_ENABLE_SNIFF_MODE. 
+    // Sniff mode aggressively throttles connections, causing the Joy-Cons to hang 
+    // or severely lag while streaming 60Hz data.
+    gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH);
     gap_set_page_scan_type(PAGE_SCAN_MODE_INTERLACED);
 
     hci_set_inquiry_mode(INQUIRY_MODE_RSSI_AND_EIR);
 
-    // 3. Initialize L2CAP and register services
     sdp_init(); 
     l2cap_init();
     
     l2cap_register_service(bt_packet_handler, PSM_HID_CONTROL, 0xffff, LEVEL_1);
     l2cap_register_service(bt_packet_handler, PSM_HID_INTERRUPT, 0xffff, LEVEL_1);
     
-    // 4. Register Event Handler
     hci_event_callback_registration.callback = &bt_packet_handler;
     hci_add_event_handler(&hci_event_callback_registration);
 
-    // 5. Explicitly wake up the CYW43 Bluetooth Controller
     hci_power_control(HCI_POWER_ON);
 }

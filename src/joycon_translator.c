@@ -15,8 +15,15 @@ void joycon_init(void) {
 }
 
 void joycon_parse_l2cap_report(const uint8_t* data, bool is_left) {
-    // 0xA1 is HID DATA input header. Report ID 0x30 is Standard Full Mode
-    if (data[0] != 0xA1 || data[1] != 0x30) return;
+    // 0xA1 is HID DATA input header.
+    if (data[0] != 0xA1) return;
+
+    // Joy-Cons blast 0x3F (Simple HID mode) reports during initialization 
+    // before the mode switch kicks in. We silently drop them to prevent console spam.
+    if (data[1] == 0x3F) return;
+
+    // Report ID 0x30 is Standard Full Mode (60Hz tracking data).
+    if (data[1] != 0x30) return;
 
     const uint8_t* report = &data[2]; // Shift to actual payload
     uint8_t right_btns = report[3];
