@@ -9,7 +9,6 @@ static custom_gamepad_report_t combined_report;
 static bool report_pending = false;
 
 void joycon_init(void) {
-    // Center the sticks explicitly on boot
     combined_report.buttons = 0;
     combined_report.hat = 0; 
     combined_report.x = 2048;
@@ -20,7 +19,8 @@ void joycon_init(void) {
 }
 
 void joycon_task(void) {
-    // Only attempt to send if a report is pending AND the USB endpoint is ready
+    // Fallback: If a report was queued because the USB endpoint was locked, 
+    // drain it as soon as the main loop polls.
     if (report_pending && tud_hid_ready()) {
         usb_send_gamepad_report(&combined_report);
         report_pending = false;
@@ -28,16 +28,10 @@ void joycon_task(void) {
 }
 
 void joycon_parse_l2cap_report(const uint8_t* data, bool is_left) {
-    // 0xA1 is HID DATA input header.
     if (data[0] != 0xA1) return;
-
-    // Joy-Cons blast 0x3F (Simple HID mode) reports during initialization 
     if (data[1] == 0x3F) return;
-
-    // Report ID 0x30 is Standard Full Mode (60Hz tracking data).
     if (data[1] != 0x30) return;
 
-    // Fixed absolute offsets for the 0x30 report payload
     uint8_t right_btns = data[4];
     uint8_t shared_btns = data[5];
     uint8_t left_btns = data[6];
@@ -47,9 +41,10 @@ void joycon_parse_l2cap_report(const uint8_t* data, bool is_left) {
         uint16_t lx = data[7] | ((data[8] & 0x0F) << 8);
         uint16_t ly = (data[8] >> 4) | (data[9] << 4);
         combined_report.x = lx;
-        combined_report.y = 4095 - ly; // Invert Y so UP is 0 in standard HID
+        // Fast Bitwise Inversion: (~val & 0xFFF) is equivalent to (4095 - val)
+        combined_report.y = (~ly) & 0x0FFF;
 
-        // D-Pad to Hat Switch Conversion
+        // D-Pad to Hat Switch
         bool d_up = left_btns & 0x02, d_down = left_btns & 0x01;
         bool d_left = left_btns & 0x08, d_right = left_btns & 0x04;
         if (d_up && d_right) combined_report.hat = 2;
@@ -79,17 +74,13 @@ void joycon_parse_l2cap_report(const uint8_t* data, bool is_left) {
         uint16_t rx = data[10] | ((data[11] & 0x0F) << 8);
         uint16_t ry = (data[11] >> 4) | (data[12] << 4);
         combined_report.z = rx;
-        combined_report.rz = 4095 - ry; // Invert Y
+        combined_report.rz = (~ry) & 0x0FFF;
 
         // --- Right Joy-Con Mapping to PC Layout (With Rotation) ---
-        // PC A (Bottom/South) = Joy-Con B
-        if (right_btns & 0x04) combined_report.buttons |= (1 << 0); else combined_report.buttons &= ~(1 << 0); 
-        // PC B (Right/East) = Joy-Con A
-        if (right_btns & 0x08) combined_report.buttons |= (1 << 1); else combined_report.buttons &= ~(1 << 1); 
-        // PC X (Left/West) = Joy-Con Y
-        if (right_btns & 0x01) combined_report.buttons |= (1 << 3); else combined_report.buttons &= ~(1 << 3); 
-        // PC Y (Top/North) = Joy-Con X
-        if (right_btns & 0x02) combined_report.buttons |= (1 << 4); else combined_report.buttons &= ~(1 << 4); 
+        if (right_btns & 0x04) combined_report.buttons |= (1 << 0); else combined_report.buttons &= ~(1 << 0); // Joy-Con B (Bottom) -> PC A (Bit 0)
+        if (right_btns & 0x08) combined_report.buttons |= (1 << 1); else combined_report.buttons &= ~(1 << 1); // Joy-Con A (Right) -> PC B (Bit 1)
+        if (right_btns & 0x01) combined_report.buttons |= (1 << 3); else combined_report.buttons &= ~(1 << 3); // Joy-Con Y (Left) -> PC X (Bit 3)
+        if (right_btns & 0x02) combined_report.buttons |= (1 << 4); else combined_report.buttons &= ~(1 << 4); // Joy-Con X (Top) -> PC Y (Bit 4)
         
         if (right_btns & 0x40) combined_report.buttons |= (1 << 7);  else combined_report.buttons &= ~(1 << 7);  // R -> Bit 7 (USB_BTN_TR)
         if (right_btns & 0x80) combined_report.buttons |= (1 << 9);  else combined_report.buttons &= ~(1 << 9);  // ZR -> Bit 9 (USB_BTN_TR2)
@@ -103,6 +94,13 @@ void joycon_parse_l2cap_report(const uint8_t* data, bool is_left) {
         if (right_btns & 0x20) combined_report.buttons |= (1 << 18); else combined_report.buttons &= ~(1 << 18); // Right SR -> Bit 18
     }
 
-    // Flag the report to be dispatched safely on the next run-loop poll tick
-    report_pending = true;
+    // --- ZERO-COPY IMMEDIATE USB INJECTION ---
+    // Try to dispatch to the host immediately to bypass run-loop queue latency
+    if (tud_hid_ready()) {
+        usb_send_gamepad_report(&combined_report);
+        report_pending = false; // Successfully sent
+    } else {
+        // If USB endpoint is busy (1ms interval lock), queue it for the task loop
+        report_pending = true;
+    }
 }

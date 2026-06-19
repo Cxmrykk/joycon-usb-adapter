@@ -24,7 +24,7 @@ uint8_t const desc_hid_report[] = {
     0xA1, 0x01,        // Collection (Application)
     0x85, 0x01,        //   Report ID (1)
     
-    // 32 Buttons (Expanded to match standard mapping offsets)
+    // 32 Buttons
     0x05, 0x09,        //   Usage Page (Button)
     0x19, 0x01,        //   Usage Minimum (1)
     0x29, 0x20,        //   Usage Maximum (32)
@@ -53,8 +53,8 @@ uint8_t const desc_hid_report[] = {
     0x05, 0x01,        //   Usage Page (Generic Desktop)
     0x09, 0x30,        //   Usage (X)
     0x09, 0x31,        //   Usage (Y)
-    0x09, 0x32,        //   Usage (Z)
-    0x09, 0x35,        //   Usage (Rz)
+    0x09, 0x32,        //   Usage (Z)  <-- Reverted from Rx to guarantee OS mapping
+    0x09, 0x35,        //   Usage (Rz) <-- Reverted from Ry to guarantee OS mapping
     0x15, 0x00,        //   Logical Minimum (0)
     0x26, 0xFF, 0x0F,  //   Logical Maximum (4095)
     0x75, 0x10,        //   Report Size (16)
@@ -68,9 +68,9 @@ tusb_desc_device_t const desc_device = {
     .bLength            = sizeof(tusb_desc_device_t),
     .bDescriptorType    = TUSB_DESC_DEVICE,
     .bcdUSB             = 0x0200,
-    .bDeviceClass       = 0xEF, // MISC Class (Required for Composite Devices)
+    .bDeviceClass       = 0xEF, 
     .bDeviceSubClass    = 0x02, 
-    .bDeviceProtocol    = 0x01, // Interface Association Descriptor (IAD)
+    .bDeviceProtocol    = 0x01, 
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = 0xCafe, 
     .idProduct          = 0x4001, 
