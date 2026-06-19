@@ -32,6 +32,7 @@ void cdc_printf(const char *format, ...) {
 static btstack_data_source_t usb_ds;
 static void usb_poll_process(btstack_data_source_t *ds, btstack_data_source_callback_type_t callback_type) {
     tud_task();
+    joycon_task(); // Dispatches pending merged gamepad reports safely
 }
 
 static btstack_timer_source_t heartbeat_timer;

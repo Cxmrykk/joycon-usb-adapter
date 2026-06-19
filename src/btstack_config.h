@@ -19,10 +19,10 @@
 #define MAX_NR_SERVICE_RECORD_ITEMS 4 
 
 #define ENABLE_HCI_CONTROLLER_TO_HOST_FLOW_CONTROL
-#define MAX_NR_CONTROLLER_ACL_BUFFERS 3
+#define MAX_NR_CONTROLLER_ACL_BUFFERS 10  // Increased from 3 to 10 to handle 60Hz streaming
 #define MAX_NR_CONTROLLER_SCO_PACKETS 0
 #define HCI_HOST_ACL_PACKET_LEN 256
-#define HCI_HOST_ACL_PACKET_NUM 3
+#define HCI_HOST_ACL_PACKET_NUM 10        // Increased from 3 to 10 to handle 60Hz streaming
 #define HCI_HOST_SCO_PACKET_LEN 0
 #define HCI_HOST_SCO_PACKET_NUM 0
 

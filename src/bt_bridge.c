@@ -76,6 +76,12 @@ static void check_device_name(bd_addr_t addr, const char* name) {
         cdc_printf("Found Right Joy-Con: %s. Connecting...\n", bd_addr_to_str(addr));
         l2cap_create_channel(bt_packet_handler, addr, PSM_HID_CONTROL, 0xffff, &jc_right_ctrl_cid);
     }
+
+    // Stop scanning once both are found to fix the 5-second multiplexing lag!
+    if (found_left && found_right) {
+        cdc_printf("Both Joy-Cons found! Stopping inquiry to dedicate bandwidth.\n");
+        gap_inquiry_stop();
+    }
 }
 
 static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size) {
@@ -159,6 +165,11 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                     }
                 }
                 
+                // Ensure inquiry stops if we accepted a blind incoming connection to fill out the set
+                if (found_left && found_right) {
+                    gap_inquiry_stop();
+                }
+
                 cdc_printf("Accepting L2CAP connection from %s...\n", bd_addr_to_str(addr));
                 l2cap_accept_connection(local_cid);
                 break;
@@ -196,6 +207,25 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                     
                     // Kick off the Nintendo 3-Step Handshake
                     jc_advance_state(is_left, JC_STATE_REQ_INFO);
+                }
+                break;
+            }
+            
+            case L2CAP_EVENT_CHANNEL_CLOSED: {
+                uint16_t local_cid = l2cap_event_channel_closed_get_local_cid(packet);
+                if (local_cid == jc_left_ctrl_cid || local_cid == jc_left_intr_cid) {
+                    cdc_printf("Left Joy-Con disconnected. Restarting scan...\n");
+                    found_left = false;
+                    jc_left_state = JC_STATE_NONE;
+                    jc_left_ctrl_cid = 0; jc_left_intr_cid = 0;
+                    gap_inquiry_periodic_start(0x03, 0x05, 0x04);
+                } 
+                else if (local_cid == jc_right_ctrl_cid || local_cid == jc_right_intr_cid) {
+                    cdc_printf("Right Joy-Con disconnected. Restarting scan...\n");
+                    found_right = false;
+                    jc_right_state = JC_STATE_NONE;
+                    jc_right_ctrl_cid = 0; jc_right_intr_cid = 0;
+                    gap_inquiry_periodic_start(0x03, 0x05, 0x04);
                 }
                 break;
             }
@@ -273,8 +303,6 @@ void bt_bridge_init(void) {
     gap_ssp_set_authentication_requirement(SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING);
     
     // CRITICAL FIX: Removed LM_LINK_POLICY_ENABLE_SNIFF_MODE. 
-    // Sniff mode aggressively throttles connections, causing the Joy-Cons to hang 
-    // or severely lag while streaming 60Hz data.
     gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH);
     gap_set_page_scan_type(PAGE_SCAN_MODE_INTERLACED);
 

@@ -23,15 +23,17 @@ uint8_t const desc_hid_report[] = {
     0x09, 0x05,        // Usage (Gamepad)
     0xA1, 0x01,        // Collection (Application)
     0x85, 0x01,        //   Report ID (1)
-    // 16 Buttons
+    
+    // 32 Buttons (Expanded to match standard mapping offsets)
     0x05, 0x09,        //   Usage Page (Button)
     0x19, 0x01,        //   Usage Minimum (1)
-    0x29, 0x10,        //   Usage Maximum (16)
+    0x29, 0x20,        //   Usage Maximum (32)
     0x15, 0x00,        //   Logical Minimum (0)
     0x25, 0x01,        //   Logical Maximum (1)
-    0x95, 0x10,        //   Report Count (16)
+    0x95, 0x20,        //   Report Count (32)
     0x75, 0x01,        //   Report Size (1)
     0x81, 0x02,        //   Input (Data, Var, Abs)
+    
     // Hat Switch (D-Pad)
     0x05, 0x01,        //   Usage Page (Generic Desktop)
     0x09, 0x39,        //   Usage (Hat switch)
@@ -46,6 +48,7 @@ uint8_t const desc_hid_report[] = {
     0x75, 0x04,        //   Report Size (4) padding
     0x95, 0x01,        //   Report Count (1) padding
     0x81, 0x03,        //   Input (Const, Var, Abs)
+    
     // 4 Analog Axes
     0x05, 0x01,        //   Usage Page (Generic Desktop)
     0x09, 0x30,        //   Usage (X)
@@ -57,6 +60,7 @@ uint8_t const desc_hid_report[] = {
     0x75, 0x10,        //   Report Size (16)
     0x95, 0x04,        //   Report Count (4)
     0x81, 0x02,        //   Input (Data, Var, Abs)
+    
     0xC0               // End Collection
 };
 
@@ -69,7 +73,7 @@ tusb_desc_device_t const desc_device = {
     .bDeviceProtocol    = 0x01, // Interface Association Descriptor (IAD)
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = 0xCafe, 
-    .idProduct          = 0x4001, // Changed PID so PC sees it as a "new" device
+    .idProduct          = 0x4001, 
     .bcdDevice          = 0x0100,
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
@@ -108,7 +112,6 @@ uint16_t const* tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
 uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen) { return 0; }
 void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const* buffer, uint16_t bufsize) {}
 
-// Missing function restored here:
 void usb_send_gamepad_report(custom_gamepad_report_t *report) {
     if (tud_hid_ready()) {
         tud_hid_report(1, report, sizeof(custom_gamepad_report_t));
