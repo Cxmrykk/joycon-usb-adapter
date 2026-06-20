@@ -5,24 +5,23 @@
 #define ENABLE_PRINTF_HEXDUMP
 #define HAVE_EMBEDDED_TIME_MS
 #define HAVE_ASSERT
-#define ENABLE_L2CAP_ENHANCED_RETRANSMISSION_MODE
 
 #define HCI_OUTGOING_PRE_BUFFER_SIZE 4
 #define HCI_ACL_PAYLOAD_SIZE 256
 #define HCI_ACL_CHUNK_SIZE_ALIGNMENT 4
 #define MAX_NR_HCI_CONNECTIONS 2
-#define MAX_NR_L2CAP_CHANNELS 6 // 2 channels (Control/Int) per Joycon
-#define MAX_NR_L2CAP_SERVICES 3 // HID Control, HID Interrupt, AND SDP
+#define MAX_NR_L2CAP_CHANNELS 6 
+#define MAX_NR_L2CAP_SERVICES 3 
 #define MAX_NR_SM_LOOKUP_ENTRIES 3
 #define MAX_NR_WHITELIST_ENTRIES 2
 
 #define MAX_NR_SERVICE_RECORD_ITEMS 4 
 
-#define ENABLE_HCI_CONTROLLER_TO_HOST_FLOW_CONTROL
-#define MAX_NR_CONTROLLER_ACL_BUFFERS 10  // Increased from 3 to 10 to handle 60Hz streaming
-#define MAX_NR_CONTROLLER_SCO_PACKETS 0
+// For real-time HID, deep queues equal deep lag. We WANT stale packets 
+// to be instantly overwritten at the baseband level.
+#define MAX_NR_CONTROLLER_ACL_BUFFERS 3  
 #define HCI_HOST_ACL_PACKET_LEN 256
-#define HCI_HOST_ACL_PACKET_NUM 10        // Increased from 3 to 10 to handle 60Hz streaming
+#define HCI_HOST_ACL_PACKET_NUM 3        
 #define HCI_HOST_SCO_PACKET_LEN 0
 #define HCI_HOST_SCO_PACKET_NUM 0
 

@@ -5,7 +5,6 @@
 
 extern void cdc_printf(const char *format, ...);
 
-// Joy-Con Initialization State Machine
 typedef enum {
     JC_STATE_NONE = 0,
     JC_STATE_REQ_INFO,
@@ -77,10 +76,12 @@ static void check_device_name(bd_addr_t addr, const char* name) {
         l2cap_create_channel(bt_packet_handler, addr, PSM_HID_CONTROL, 0xffff, &jc_right_ctrl_cid);
     }
 
-    // Stop scanning once both are found to fix the 5-second multiplexing lag!
+    // STRICT RADIO LOCKDOWN: Stop scanning & connectability to dedicate antenna to HID data
     if (found_left && found_right) {
-        cdc_printf("Both Joy-Cons found! Stopping inquiry to dedicate bandwidth.\n");
+        cdc_printf("Both Joy-Cons found! Locking down radio bandwidth.\n");
         gap_inquiry_stop();
+        gap_connectable_control(0);
+        gap_discoverable_control(0);
     }
 }
 
@@ -91,7 +92,16 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
             case BTSTACK_EVENT_STATE:
                 if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
                     cdc_printf("Bluetooth Baseband Working. Scanning for Joy-Cons...\n");
-                    gap_inquiry_periodic_start(0x03, 0x05, 0x04); 
+                    // CRITICAL FIX: Use manual 1-shot inquiry instead of periodic background sweeps
+                    gap_inquiry_start(0x05); 
+                }
+                break;
+
+            case GAP_EVENT_INQUIRY_COMPLETE:
+                // If the inquiry finished but we don't have both, manually fire it again.
+                // This gives us complete control over when the radio is allowed to scan.
+                if (!found_left || !found_right) {
+                    gap_inquiry_start(0x05);
                 }
                 break;
 
@@ -129,7 +139,6 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
             case HCI_EVENT_PIN_CODE_REQUEST: {
                 bd_addr_t event_addr;
                 hci_event_pin_code_request_get_bd_addr(packet, event_addr);
-                cdc_printf("PIN Code Requested for %s. Replying with 0000...\n", bd_addr_to_str(event_addr));
                 gap_pin_code_response_binary(event_addr, (uint8_t*)"0000", 4);
                 break;
             }
@@ -137,7 +146,6 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
             case HCI_EVENT_USER_CONFIRMATION_REQUEST: {
                 bd_addr_t event_addr;
                 hci_event_user_confirmation_request_get_bd_addr(packet, event_addr);
-                cdc_printf("SSP User Confirmation Requested for %s. Auto-accepting...\n", bd_addr_to_str(event_addr));
                 gap_ssp_confirmation_response(event_addr);
                 break;
             }
@@ -165,47 +173,37 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                     }
                 }
                 
-                // Ensure inquiry stops if we accepted a blind incoming connection to fill out the set
                 if (found_left && found_right) {
                     gap_inquiry_stop();
+                    gap_connectable_control(0);
                 }
 
-                cdc_printf("Accepting L2CAP connection from %s...\n", bd_addr_to_str(addr));
                 l2cap_accept_connection(local_cid);
                 break;
             }
 
             case L2CAP_EVENT_CHANNEL_OPENED: {
-                if (l2cap_event_channel_opened_get_status(packet)) {
-                    cdc_printf("Failed to open L2CAP channel!\n");
-                    return;
-                }
+                if (l2cap_event_channel_opened_get_status(packet)) return;
                 
                 uint16_t psm = l2cap_event_channel_opened_get_psm(packet);
                 bd_addr_t addr;
                 l2cap_event_channel_opened_get_address(packet, addr);
                 uint16_t local_cid = l2cap_event_channel_opened_get_local_cid(packet);
                 bool incoming = l2cap_event_channel_opened_get_incoming(packet);
-
                 bool is_left = (bd_addr_cmp(addr, jc_left_addr) == 0);
 
                 if (psm == PSM_HID_CONTROL) {
-                    cdc_printf("HID Control Opened for %s (Incoming: %d)\n", is_left ? "Left" : "Right", incoming);
                     if (is_left) jc_left_ctrl_cid = local_cid;
                     else jc_right_ctrl_cid = local_cid;
                     
                     if (!incoming) {
-                        cdc_printf("Initiating HID Interrupt channel...\n");
                         l2cap_create_channel(bt_packet_handler, addr, PSM_HID_INTERRUPT, 0xffff, 
                             is_left ? &jc_left_intr_cid : &jc_right_intr_cid);
                     }
                 } 
                 else if (psm == PSM_HID_INTERRUPT) {
-                    cdc_printf("HID Interrupt Opened for %s. Starting init sequence...\n", is_left ? "Left" : "Right");
                     if (is_left) jc_left_intr_cid = local_cid;
                     else jc_right_intr_cid = local_cid;
-                    
-                    // Kick off the Nintendo 3-Step Handshake
                     jc_advance_state(is_left, JC_STATE_REQ_INFO);
                 }
                 break;
@@ -218,14 +216,16 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                     found_left = false;
                     jc_left_state = JC_STATE_NONE;
                     jc_left_ctrl_cid = 0; jc_left_intr_cid = 0;
-                    gap_inquiry_periodic_start(0x03, 0x05, 0x04);
+                    gap_connectable_control(1);
+                    gap_inquiry_start(0x05);
                 } 
                 else if (local_cid == jc_right_ctrl_cid || local_cid == jc_right_intr_cid) {
                     cdc_printf("Right Joy-Con disconnected. Restarting scan...\n");
                     found_right = false;
                     jc_right_state = JC_STATE_NONE;
                     jc_right_ctrl_cid = 0; jc_right_intr_cid = 0;
-                    gap_inquiry_periodic_start(0x03, 0x05, 0x04);
+                    gap_connectable_control(1);
+                    gap_inquiry_start(0x05);
                 }
                 break;
             }
@@ -238,10 +238,10 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                     if (jc_left_state == JC_STATE_REQ_INFO) {
                         send_subcmd(local_cid, 0x02, NULL, 0);
                     } else if (jc_left_state == JC_STATE_SET_MODE) {
-                        uint8_t arg = 0x30; // Standard Full Mode
+                        uint8_t arg = 0x30; 
                         send_subcmd(local_cid, 0x03, &arg, 1);
                     } else if (jc_left_state == JC_STATE_SET_LED) {
-                        uint8_t arg = 0x01; // P1 LED
+                        uint8_t arg = 0x01; 
                         send_subcmd(local_cid, 0x30, &arg, 1);
                     }
                 } 
@@ -253,7 +253,7 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                         uint8_t arg = 0x30;
                         send_subcmd(local_cid, 0x03, &arg, 1);
                     } else if (jc_right_state == JC_STATE_SET_LED) {
-                        uint8_t arg = 0x02; // P2 LED
+                        uint8_t arg = 0x02; 
                         send_subcmd(local_cid, 0x30, &arg, 1);
                     }
                 }
@@ -266,13 +266,11 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
         bool is_right = (channel == jc_right_intr_cid);
 
         if (is_left || is_right) {
-            uint8_t report_id = packet[1]; // packet[0] is 0xA1 (HID DATA)
+            uint8_t report_id = packet[1]; 
             
             // Subcommand ACK
             if (report_id == 0x21 && size >= 16) {
                 uint8_t subcmd_replied = packet[15];
-                cdc_printf("<- Received ACK for subcmd 0x%02x from %s\n", subcmd_replied, is_left ? "Left" : "Right");
-                
                 jc_state_t current_state = is_left ? jc_left_state : jc_right_state;
                 
                 if (current_state == JC_STATE_REQ_INFO && subcmd_replied == 0x02) {
@@ -302,7 +300,6 @@ void bt_bridge_init(void) {
     gap_ssp_set_io_capability(SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
     gap_ssp_set_authentication_requirement(SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING);
     
-    // CRITICAL FIX: Removed LM_LINK_POLICY_ENABLE_SNIFF_MODE. 
     gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH);
     gap_set_page_scan_type(PAGE_SCAN_MODE_INTERLACED);
 
