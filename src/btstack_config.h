@@ -25,5 +25,7 @@
 #define HCI_HOST_SCO_PACKET_LEN 0
 #define HCI_HOST_SCO_PACKET_NUM 0
 
+// Required by the Pico SDK to compile btstack_link_key_db_tlv.c. 
+// We actively clear this DB in bt_bridge.c to force clean pairing.
 #define NVM_NUM_LINK_KEYS 4
 #define NVM_NUM_DEVICE_DB_ENTRIES 4

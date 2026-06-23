@@ -66,17 +66,18 @@ static void check_device_name(bd_addr_t addr, const char* name) {
     if (strcmp(name, "Joy-Con (L)") == 0 && !found_left) {
         found_left = true;
         bd_addr_copy(jc_left_addr, addr);
-        cdc_printf("Found Left Joy-Con: %s. Connecting...\n", bd_addr_to_str(addr));
+        cdc_printf("Found Left Joy-Con: %s. Pausing scan to connect...\n", bd_addr_to_str(addr));
+        gap_inquiry_stop(); // Suspend scanning to dedicate bandwidth to connecting
         l2cap_create_channel(bt_packet_handler, addr, PSM_HID_CONTROL, 0xffff, &jc_left_ctrl_cid);
     } 
     else if (strcmp(name, "Joy-Con (R)") == 0 && !found_right) {
         found_right = true;
         bd_addr_copy(jc_right_addr, addr);
-        cdc_printf("Found Right Joy-Con: %s. Connecting...\n", bd_addr_to_str(addr));
+        cdc_printf("Found Right Joy-Con: %s. Pausing scan to connect...\n", bd_addr_to_str(addr));
+        gap_inquiry_stop(); // Suspend scanning to dedicate bandwidth to connecting
         l2cap_create_channel(bt_packet_handler, addr, PSM_HID_CONTROL, 0xffff, &jc_right_ctrl_cid);
     }
 
-    // STRICT RADIO LOCKDOWN: Stop scanning & connectability to dedicate antenna to HID data
     if (found_left && found_right) {
         cdc_printf("Both Joy-Cons found! Locking down radio bandwidth.\n");
         gap_inquiry_stop();
@@ -92,14 +93,11 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
             case BTSTACK_EVENT_STATE:
                 if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
                     cdc_printf("Bluetooth Baseband Working. Scanning for Joy-Cons...\n");
-                    // CRITICAL FIX: Use manual 1-shot inquiry instead of periodic background sweeps
                     gap_inquiry_start(0x05); 
                 }
                 break;
 
             case GAP_EVENT_INQUIRY_COMPLETE:
-                // If the inquiry finished but we don't have both, manually fire it again.
-                // This gives us complete control over when the radio is allowed to scan.
                 if (!found_left || !found_right) {
                     gap_inquiry_start(0x05);
                 }
@@ -173,9 +171,11 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                     }
                 }
                 
+                gap_inquiry_stop(); // Suspend scanning while handling incoming connection
+
                 if (found_left && found_right) {
-                    gap_inquiry_stop();
                     gap_connectable_control(0);
+                    gap_discoverable_control(0);
                 }
 
                 l2cap_accept_connection(local_cid);
@@ -183,11 +183,28 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
             }
 
             case L2CAP_EVENT_CHANNEL_OPENED: {
-                if (l2cap_event_channel_opened_get_status(packet)) return;
-                
-                uint16_t psm = l2cap_event_channel_opened_get_psm(packet);
                 bd_addr_t addr;
                 l2cap_event_channel_opened_get_address(packet, addr);
+                uint8_t status = l2cap_event_channel_opened_get_status(packet);
+                
+                if (status) {
+                    cdc_printf("L2CAP Connection Failed (status 0x%02x). Dropping key...\n", status);
+                    gap_drop_link_key_for_bd_addr(addr); // Force clean slate if negotiation fails
+                    
+                    if (bd_addr_cmp(addr, jc_left_addr) == 0) {
+                        found_left = false;
+                        jc_left_state = JC_STATE_NONE;
+                    } else if (bd_addr_cmp(addr, jc_right_addr) == 0) {
+                        found_right = false;
+                        jc_right_state = JC_STATE_NONE;
+                    }
+                    if (!found_left || !found_right) {
+                        gap_inquiry_start(0x05); // Restart scan on failure
+                    }
+                    return;
+                }
+                
+                uint16_t psm = l2cap_event_channel_opened_get_psm(packet);
                 uint16_t local_cid = l2cap_event_channel_opened_get_local_cid(packet);
                 bool incoming = l2cap_event_channel_opened_get_incoming(packet);
                 bool is_left = (bd_addr_cmp(addr, jc_left_addr) == 0);
@@ -205,6 +222,11 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                     if (is_left) jc_left_intr_cid = local_cid;
                     else jc_right_intr_cid = local_cid;
                     jc_advance_state(is_left, JC_STATE_REQ_INFO);
+                    
+                    // Connection completed successfully. Resume scan if the other Joy-Con is missing.
+                    if (!found_left || !found_right) {
+                        gap_inquiry_start(0x05);
+                    }
                 }
                 break;
             }
@@ -212,18 +234,22 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
             case L2CAP_EVENT_CHANNEL_CLOSED: {
                 uint16_t local_cid = l2cap_event_channel_closed_get_local_cid(packet);
                 if (local_cid == jc_left_ctrl_cid || local_cid == jc_left_intr_cid) {
-                    cdc_printf("Left Joy-Con disconnected. Restarting scan...\n");
+                    cdc_printf("Left Joy-Con disconnected. Dropping key and restarting scan...\n");
+                    gap_drop_link_key_for_bd_addr(jc_left_addr); // Prevent persistent dead keys
                     found_left = false;
                     jc_left_state = JC_STATE_NONE;
                     jc_left_ctrl_cid = 0; jc_left_intr_cid = 0;
+                    memset(jc_left_addr, 0, 6);
                     gap_connectable_control(1);
                     gap_inquiry_start(0x05);
                 } 
                 else if (local_cid == jc_right_ctrl_cid || local_cid == jc_right_intr_cid) {
-                    cdc_printf("Right Joy-Con disconnected. Restarting scan...\n");
+                    cdc_printf("Right Joy-Con disconnected. Dropping key and restarting scan...\n");
+                    gap_drop_link_key_for_bd_addr(jc_right_addr); // Prevent persistent dead keys
                     found_right = false;
                     jc_right_state = JC_STATE_NONE;
                     jc_right_ctrl_cid = 0; jc_right_intr_cid = 0;
+                    memset(jc_right_addr, 0, 6);
                     gap_connectable_control(1);
                     gap_inquiry_start(0x05);
                 }
@@ -293,6 +319,10 @@ static void bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
 
 void bt_bridge_init(void) {
     gap_set_security_level(LEVEL_1); 
+    
+    // GUARANTEE AMNESIA: Wipe all saved Link Keys on Boot
+    gap_delete_all_link_keys();
+    
     gap_connectable_control(1);
     gap_discoverable_control(0);
     
